@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from "next/server";
-import Anthropic from "@anthropic-ai/sdk";
 
 export interface RegexToken {
   text: string;
@@ -16,27 +15,11 @@ export interface RegexGenerationResponse {
   failingCases?: string[];
 }
 
-const SYSTEM_PROMPT = `You are a regex generation engine. Given a list of strings that must match and a list that must not match, output ONLY valid JSON with this exact shape:
-{
-  "pattern": string,
-  "flags": string,
-  "tokens": [
-    {
-      "text": string,
-      "explanation": string
-    }
-  ],
-  "gotchas": string[]
-}
-The regex must be JavaScript-compatible (no lookbehind assumptions beyond ES2018).
-Do not include markdown fences or any text outside the JSON object.`;
-
 /**
  * Strips markdown fences defensively from string
  */
 function cleanJsonOutput(raw: string): string {
   let cleaned = raw.trim();
-  // Remove markdown code fences if present
   if (cleaned.startsWith("```")) {
     cleaned = cleaned.replace(/^```(?:json)?\s*/i, "");
     cleaned = cleaned.replace(/```\s*$/i, "");
@@ -54,8 +37,6 @@ function validateRegex(
   noMatchExamples: string[]
 ): { isValid: boolean; failures: string[] } {
   try {
-    // Note: global flag 'g' causes stateful lastIndex issues on .test() in loops,
-    // so we strip 'g' and 'y' for individual string validation or reset lastIndex
     const sanitizedFlags = flags.replace(/[gy]/g, "");
     const regex = new RegExp(pattern, sanitizedFlags);
     const failures: string[] = [];
@@ -88,6 +69,97 @@ function validateRegex(
   }
 }
 
+/**
+ * Calls Gemini REST API generateContent endpoint with JSON response mode
+ */
+async function callGemini(promptText: string, apiKey: string): Promise<string> {
+  const modelEndpoints = [
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
+  ];
+
+  let lastError: Error | null = null;
+
+  for (const endpoint of modelEndpoints) {
+    try {
+      const res = await fetch(`${endpoint}?key=${apiKey}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [{ text: promptText }],
+            },
+          ],
+          generationConfig: {
+            responseMimeType: "application/json",
+          },
+        }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        if (res.status === 404 || data?.error?.message?.includes("not found")) {
+          // Model not found on this endpoint, try next candidate
+          continue;
+        }
+        throw new Error(data?.error?.message || `Gemini API error: ${res.statusText}`);
+      }
+
+      const generatedText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (generatedText) {
+        return generatedText;
+      }
+    } catch (err: any) {
+      lastError = err;
+    }
+  }
+
+  throw lastError || new Error("Failed to generate content from Gemini API.");
+}
+
+function buildPrompt(
+  matchExamples: string[],
+  noMatchExamples: string[],
+  failures?: string[]
+): string {
+  let prompt = `You are a regex generation engine. Given a list of strings that must match and a list that must not match, output ONLY valid JSON with this exact shape:
+{
+  "pattern": string,
+  "flags": string,
+  "tokens": [
+    {
+      "text": string,
+      "explanation": string
+    }
+  ],
+  "gotchas": string[]
+}
+The regex must be JavaScript-compatible (no lookbehind assumptions beyond ES2018).
+Do not include markdown fences or any text outside the JSON object.
+
+Strings that MUST match:
+${matchExamples.map((s, idx) => `${idx + 1}. "${s}"`).join("\n")}
+
+Strings that must NOT match:
+${noMatchExamples.map((s, idx) => `${idx + 1}. "${s}"`).join("\n")}`;
+
+  if (failures && failures.length > 0) {
+    prompt += `\n\nYour previous pattern failed on these cases:
+${failures.map((f) => `- ${f}`).join("\n")}
+
+Fix the pattern and return the same JSON shape.`;
+  } else {
+    prompt += `\n\nGenerate a JavaScript RegExp that precisely matches all the positive examples and none of the negative examples.`;
+  }
+
+  return prompt;
+}
+
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
@@ -111,88 +183,24 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const apiKey = process.env.ANTHROPIC_API_KEY;
+    const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
       return NextResponse.json(
         {
           error:
-            "Missing ANTHROPIC_API_KEY environment variable. Please set it in .env.local.",
+            "Missing GEMINI_API_KEY environment variable. Please set it in .env.local.",
         },
         { status: 500 }
       );
     }
 
-    const anthropic = new Anthropic({ apiKey });
-
-    const userPrompt = `Strings that MUST match:
-${matchExamples.map((s, idx) => `${idx + 1}. "${s}"`).join("\n")}
-
-Strings that must NOT match:
-${noMatchExamples.map((s, idx) => `${idx + 1}. "${s}"`).join("\n")}
-
-Generate a JavaScript RegExp that precisely matches all the positive examples and none of the negative examples.`;
-
-    // Messages history for potential retry loop
-    const messages: Anthropic.MessageParam[] = [
-      {
-        role: "user",
-        content: userPrompt,
-      },
-    ];
-
-    // Attempt primary call with claude-sonnet-4-6 (or fallback if model name unavailable)
-    const modelCandidates = [
-      "claude-sonnet-4-6",
-      "claude-3-7-sonnet-20250219",
-      "claude-3-5-sonnet-20241022",
-      "claude-3-5-sonnet-latest",
-    ];
-
-    let firstAttemptText = "";
-    let usedModel = modelCandidates[0];
-
-    for (const model of modelCandidates) {
-      try {
-        const response = await anthropic.messages.create({
-          model,
-          system: SYSTEM_PROMPT,
-          messages,
-          max_tokens: 2000,
-          temperature: 0.1,
-        });
-
-        const textBlock = response.content.find((b) => b.type === "text");
-        if (textBlock && textBlock.type === "text") {
-          firstAttemptText = textBlock.text;
-          usedModel = model;
-          break;
-        }
-      } catch (err: any) {
-        // If it's a 404/model not found error, try next candidate
-        if (
-          err?.status === 404 ||
-          err?.message?.includes("model") ||
-          err?.error?.type === "not_found_error"
-        ) {
-          continue;
-        }
-        throw err;
-      }
-    }
-
-    if (!firstAttemptText) {
-      return NextResponse.json(
-        {
-          error:
-            "Couldn't generate a valid pattern — try simplifying your examples",
-        },
-        { status: 502 }
-      );
-    }
+    // Step 1: Initial call to Gemini
+    const initialPrompt = buildPrompt(matchExamples, noMatchExamples);
+    let rawResponse = await callGemini(initialPrompt, apiKey);
 
     let parsedResult: RegexGenerationResponse;
     try {
-      parsedResult = JSON.parse(cleanJsonOutput(firstAttemptText));
+      parsedResult = JSON.parse(cleanJsonOutput(rawResponse));
     } catch {
       return NextResponse.json(
         {
@@ -203,7 +211,7 @@ Generate a JavaScript RegExp that precisely matches all the positive examples an
       );
     }
 
-    // Server-side validation
+    // Step 2: Server-side validation
     let validation = validateRegex(
       parsedResult.pattern,
       parsedResult.flags || "",
@@ -213,52 +221,29 @@ Generate a JavaScript RegExp that precisely matches all the positive examples an
 
     let retried = false;
 
-    // Auto-retry once if any example fails
+    // Step 3: Automatic retry loop if any test case fails
     if (!validation.isValid) {
       retried = true;
-      messages.push({
-        role: "assistant",
-        content: firstAttemptText,
-      });
-
-      const retryUserMessage = `Your previous pattern failed on these cases:\n${validation.failures
-        .map((f) => `- ${f}`)
-        .join("\n")}\n\nFix the pattern and return the same JSON shape.`;
-
-      messages.push({
-        role: "user",
-        content: retryUserMessage,
-      });
-
       try {
-        const retryResponse = await anthropic.messages.create({
-          model: usedModel,
-          system: SYSTEM_PROMPT,
-          messages,
-          max_tokens: 2000,
-          temperature: 0.1,
-        });
-
-        const retryTextBlock = retryResponse.content.find(
-          (b) => b.type === "text"
+        const retryPrompt = buildPrompt(
+          matchExamples,
+          noMatchExamples,
+          validation.failures
         );
-        if (retryTextBlock && retryTextBlock.type === "text") {
-          const secondParsed: RegexGenerationResponse = JSON.parse(
-            cleanJsonOutput(retryTextBlock.text)
-          );
-          parsedResult = secondParsed;
+        const retryRawResponse = await callGemini(retryPrompt, apiKey);
+        const retryParsed: RegexGenerationResponse = JSON.parse(
+          cleanJsonOutput(retryRawResponse)
+        );
 
-          // Re-validate second attempt
-          validation = validateRegex(
-            parsedResult.pattern,
-            parsedResult.flags || "",
-            matchExamples,
-            noMatchExamples
-          );
-        }
+        parsedResult = retryParsed;
+        validation = validateRegex(
+          parsedResult.pattern,
+          parsedResult.flags || "",
+          matchExamples,
+          noMatchExamples
+        );
       } catch (retryError) {
-        console.error("Retry attempt error:", retryError);
-        // If retry fails parsing/calling, we still return the first parsed result with failure markers
+        console.error("Gemini retry error:", retryError);
       }
     }
 
