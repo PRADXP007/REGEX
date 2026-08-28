@@ -1,0 +1,101 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Newsreader:opsz,wght@6..72,400;6..72,700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: #15181d;
+  --paper: #ede6d3;
+  --brass: #b4903e;
+  --rust: #9c4535;
+}
+
+body {
+  background-color: #15181d;
+  color: #ede6d3;
+  font-family: "JetBrains Mono", monospace;
+}
+
+.border-paper {
+  border-color: #ede6d3;
+}
+
+.stamp {
+  display: inline-block;
+  opacity: 0;
+  transform: scale(1.5) rotate(0deg);
+}
+
+.stamp.stamped {
+  animation: stamp-anim 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;
+}
+
+.stamp.pass {
+  color: #b4903e;
+}
+
+.stamp.fail {
+  color: #9c4535;
+}
+
+@keyframes stamp-anim {
+  0% {
+    transform: scale(1.5) rotate(-10deg);
+    opacity: 0;
+  }
+  50% {
+    transform: scale(0.9) rotate(5deg);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1) var(--target-rotation, rotate(0deg));
+    opacity: 1;
+  }
+}
+
+.bg-paper-text-ink {
+  background-color: #ede6d3;
+  color: #15181d;
+}
+
+.hover-invert:hover {
+  background-color: #ede6d3;
+  color: #15181d;
+}
+
+input {
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid #ede6d3;
+  color: #ede6d3;
+  outline: none;
+  box-shadow: none !important;
+  padding: 4px 0;
+  margin-bottom: 8px;
+}
+
+input:focus {
+  border-bottom: 2px solid #ede6d3;
+}
+
+.leader-line {
+  flex-grow: 1;
+  border-bottom: 1px dotted #ede6d3;
+  margin: 0 12px;
+  position: relative;
+  top: -4px;
+  opacity: 0.5;
+}
+
+/* Custom scrollbars matching proof sheet */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track {
+  background: #15181d;
+}
+::-webkit-scrollbar-thumb {
+  background: #ede6d3;
+}
