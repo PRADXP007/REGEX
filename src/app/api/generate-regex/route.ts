@@ -83,10 +83,11 @@ async function callGemini(promptText: string, apiKey: string): Promise<string> {
 
   for (const endpoint of modelEndpoints) {
     try {
-      const res = await fetch(`${endpoint}?key=${apiKey}`, {
+      const res = await fetch(`${endpoint}?key=${encodeURIComponent(apiKey)}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          "x-goog-api-key": apiKey,
         },
         body: JSON.stringify({
           contents: [
